@@ -136,6 +136,74 @@ def _resolve_gpu_relax(use_gpu_relax: bool) -> bool:
     return False
 
 
+def _on_gpu() -> bool:
+    """True if jax has a GPU (CUDA or ROCm); Pallas and the fused CUDA kernels need one."""
+    try:
+        import jax
+        return jax.devices()[0].platform == "gpu"
+    except Exception:
+        return False
+
+
+def _compute_capability():
+    """Give the GPU compute capability as an integer, e.g. 75, or None."""
+    try:
+        import jax
+        cc = str(jax.devices()[0].compute_capability)
+        return int(round(float(cc) * 10)) if "." in cc else int(cc)
+    except Exception:
+        return None
+
+
+def _load_haiku_params(data_module, *, model_name: str, data_dir: str, use_fuse: bool):
+    """Load Haiku params, keeping their layout consistent with ``use_fuse``.
+
+    ``fuse_projection_weights=True`` in the model config expects the
+    triangle-multiplication parameters to be pre-fused inside the loaded
+    ``.npz``. If the installed ``alphafold.model.data.get_model_haiku_params``
+    supports a ``fuse``/``use_fuse`` keyword, we pass it through so loading
+    matches the config. If it doesn't support that keyword and fusion was
+    requested, we fail fast here with a clear message instead of letting
+    Haiku raise an opaque "Unable to retrieve parameter ..." deep inside the
+    forward pass.
+    """
+    import inspect
+
+    sig = inspect.signature(data_module.get_model_haiku_params)
+    fuse_kwarg = None
+    for candidate in ("fuse", "use_fuse"):
+        if candidate in sig.parameters:
+            fuse_kwarg = candidate
+            break
+
+    if fuse_kwarg is not None:
+        return data_module.get_model_haiku_params(
+            model_name=model_name, data_dir=data_dir, **{fuse_kwarg: use_fuse}
+        )
+
+    if use_fuse:
+        raise ValueError(
+            "use_fuse=True was requested, but this installation's "
+            "alphafold.model.data.get_model_haiku_params(...) has no "
+            "'fuse'/'use_fuse' keyword, so the loaded checkpoint's parameter "
+            "layout cannot be guaranteed to match "
+            "fuse_projection_weights=True. Either upgrade/patch that "
+            "function to support fusing on load, or pass use_fuse=False."
+        )
+    return data_module.get_model_haiku_params(model_name=model_name, data_dir=data_dir)
+
+
+def _warn_if_kernels_missing(cc) -> None:
+    """Warn (rather than fail) when the legacy CUDA kernels aren't available for this GPU."""
+    try:
+        from alphafold.model import volta_attn
+        if cc is not None and volta_attn.available(cc) and volta_attn.ops_available(cc):
+            return
+    except Exception:
+        pass
+    logging.warning("no colabfold-legacy-kernels for sm_%s; falling back to XLA", cc or "unknown")
+
+
 def _jnp_to_np(output):
     """Recursively changes jax arrays to numpy arrays."""
     for k, v in output.items():
@@ -476,6 +544,9 @@ class AlphaFold2Backend(FoldingBackend):
         model_names_custom: List[str] = None,
         msa_depth=None,
         dropout=False,
+        use_fast_kernels: bool = True,
+        kernel_backend: str = "auto",
+        use_fuse: bool = True,
         **kwargs,
     ) -> Dict:
         """
@@ -501,6 +572,23 @@ class AlphaFold2Backend(FoldingBackend):
             If set to True, resumes prediction from partially completed runs, default is True.
         dropout : bool, optional
             If set to True, use dropout when inferring for more diverse predictions, default is False.
+        use_fast_kernels : bool, optional
+            If set to True, enables the fused attention kernels (Pallas/Triton on
+            sm_80+, or the legacy CUDA kernels on older GPUs) instead of plain XLA.
+            Default is True; set to False to force plain XLA (e.g. while
+            diagnosing a kernel-shape error such as a Pallas/Triton
+            "all dimensions of b must be >= 16").
+        kernel_backend : str, optional
+            Which fused-kernel backend to use when ``use_fast_kernels`` is True:
+            "auto" (default, picks "pallas" on sm_80+ and "cuda_legacy" otherwise),
+            "pallas", or "cuda_legacy". Has no effect if ``use_fast_kernels`` is False.
+        use_fuse : bool, optional
+            If set to True (default), enables fused triangle-multiplication
+            projections (``fuse_projection_weights``) in the evoformer and
+            template pair stacks, and the weight loader is asked to match
+            (see below). Set to False if you hit "Unable to retrieve
+            parameter ..." for a triangle_multiplication module, which means
+            your ``.npz`` checkpoint is not in fused layout.
         **kwargs : dict
             Additional keyword arguments for model runner configuration.
 
@@ -513,6 +601,9 @@ class AlphaFold2Backend(FoldingBackend):
         ------
         Exception
             If provided custom model names are not part of the available models.
+        ValueError
+            If ``kernel_backend="pallas"`` is requested explicitly on a GPU older
+            than sm_80.
         """
 
         _ensure_typing_dataclass_transform()
@@ -530,6 +621,13 @@ class AlphaFold2Backend(FoldingBackend):
             )
             jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
             jax.config.update("jax_persistent_cache_min_entry_size_bytes", 0)
+
+        if kernel_backend != "auto" and not use_fast_kernels:
+            logging.warning("kernel_backend has no effect without use_fast_kernels")
+
+        if use_fast_kernels and not _on_gpu():
+            logging.warning("fused kernels need a GPU; ignoring use_fast_kernels")
+            use_fast_kernels = False
 
         num_ensemble = 1
         model_runners = {}
@@ -563,8 +661,36 @@ class AlphaFold2Backend(FoldingBackend):
             if dropout:
                 model_config.model.global_config.eval_dropout = True
 
-            model_params = data.get_model_haiku_params(
-                model_name=model_name, data_dir=model_dir
+            cc = _compute_capability()
+            backend = kernel_backend
+            if backend == "auto":
+                # XLA gates Pallas/Triton to sm_80+.
+                backend = "cuda_legacy" if cc is not None and cc < 80 else "pallas"
+            if use_fast_kernels and backend == "pallas" and cc is not None and cc < 80:
+                raise ValueError(
+                    f"--kernel-backend pallas needs sm_80+, this GPU is sm_{cc}; "
+                    "use auto or cuda_legacy")
+            model_config.model.global_config.use_pallas = use_fast_kernels
+            model_config.model.global_config.kernel_backend = backend
+            model_config.model.global_config.compute_capability = cc
+            # Volta/Turing tensor cores have no bfloat16
+            if use_fast_kernels and backend == "cuda_legacy":
+                model_config.model.global_config.half_dtype = "float16"
+                _warn_if_kernels_missing(cc)
+
+            # Fused triangle-multiplication projections. Only turn this on if the
+            # checkpoint you are loading was actually packed in fused format --
+            # see the use_fuse docstring above for why a mismatch here raises a
+            # Haiku "Unable to retrieve parameter" error instead of a silent
+            # slowdown.
+            model_config.model.embeddings_and_evoformer.evoformer.triangle_multiplication_incoming.fuse_projection_weights = use_fuse
+            model_config.model.embeddings_and_evoformer.evoformer.triangle_multiplication_outgoing.fuse_projection_weights = use_fuse
+            if "multimer" in model_name:
+                model_config.model.embeddings_and_evoformer.template.template_pair_stack.triangle_multiplication_incoming.fuse_projection_weights = use_fuse
+                model_config.model.embeddings_and_evoformer.template.template_pair_stack.triangle_multiplication_outgoing.fuse_projection_weights = use_fuse
+
+            model_params = _load_haiku_params(
+                data, model_name=model_name, data_dir=model_dir, use_fuse=use_fuse
             )
             model_runner = model.RunModel(model_config, model_params)
 
