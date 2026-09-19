@@ -110,6 +110,97 @@ class ResultsForSeed:
 
 
 # -----------------------------------------------------------------------------
+# Fused-kernel backend selection for AF3's dot-product attention (tokamax)
+# -----------------------------------------------------------------------------
+
+# Per AF3's own run_alphafold.py docs: "Flash attention implementation to use.
+# Options: 'triton', 'cudnn', or 'xla'. Triton is fastest and requires Ampere
+# GPUs or later."
+_KNOWN_FLASH_ATTENTION_IMPLEMENTATIONS = ("triton", "cudnn", "xla")
+
+
+def _resolve_flash_attention_implementation(
+    requested: str, compute_capability: float | None
+) -> str:
+    """Resolve "auto" to a concrete tokamax implementation for this GPU.
+
+    - "triton" is fastest but is only documented/supported on Ampere (sm_80)
+      or later.
+    - "cudnn" covers Volta/Turing (sm_70+) via cuDNN's fused attention
+      kernels.
+    - Anything older than sm_70, or no GPU detected at all, falls back to
+      plain "xla".
+
+    If the caller asks for a specific implementation explicitly (not "auto"),
+    it is returned as-is, except that requesting "triton" on a GPU older than
+    sm_80 raises immediately with a clear message instead of failing deep
+    inside a tokamax/Pallas compile.
+    """
+    if requested != "auto":
+        if requested not in _KNOWN_FLASH_ATTENTION_IMPLEMENTATIONS:
+            raise ValueError(
+                f"Unknown flash_attention_implementation={requested!r}; "
+                f"expected one of {_KNOWN_FLASH_ATTENTION_IMPLEMENTATIONS} "
+                "or 'auto'."
+            )
+        if (
+            requested == "triton"
+            and compute_capability is not None
+            and compute_capability < 8.0
+        ):
+            raise ValueError(
+                "flash_attention_implementation='triton' needs Ampere "
+                f"(sm_80) or later; this GPU is sm_{compute_capability:.1f}. "
+                "Use 'auto', 'cudnn', or 'xla' instead."
+            )
+        return requested
+
+    if compute_capability is None:
+        return "xla"
+    if compute_capability >= 8.0:
+        return "triton"
+    if compute_capability >= 7.0:
+        return "cudnn"
+    return "xla"
+
+
+def _warn_if_blackwell_triton_regression(
+    implementation: str, compute_capability: float | None
+) -> None:
+    """Warn about a known tokamax Triton tile-selection bug on Blackwell.
+
+    tokamax's PallasTritonGatedLinearUnit picks its Triton tile size from
+    operand shapes and SM count only, ignoring per-block shared-memory
+    capacity. On Blackwell GPUs with a 101376 B per-block shared-memory limit
+    and <= 96 SMs (e.g. RTX PRO 4500/6000 Blackwell, GB10 -- all compute
+    capability 12.x), this makes AF3 inference at sequence length >= 1024
+    fail to compile with RESOURCE_EXHAUSTED. It was confirmed to reproduce on
+    JAX 0.11.2 nightly builds and is fixed upstream in a later tokamax
+    release (see openxla/tokamax#1361).
+
+    This only warns -- it does not silently switch implementation, since we
+    can't know from here whether the installed tokamax already has the fix.
+    """
+    if implementation != "triton" or compute_capability is None:
+        return
+    # jax reports Blackwell as compute capability 10.x/12.x depending on SKU;
+    # treat "very new, likely post-Hopper" hardware as in-scope for the warning.
+    if compute_capability >= 9.0:
+        logging.warning(
+            "flash_attention_implementation='triton' was selected on a very "
+            "recent GPU (compute capability %.1f). If you are on a Blackwell "
+            "part with <= 96 SMs (e.g. RTX PRO 4500/6000 Blackwell, GB10) and "
+            "JAX ~0.11.x, a known tokamax bug "
+            "(PallasTritonGatedLinearUnit tile selection, openxla/tokamax#1361) "
+            "can raise RESOURCE_EXHAUSTED when compiling inference at "
+            "sequence length >= 1024. If that happens, retry with "
+            "flash_attention_implementation='cudnn' or 'xla', or upgrade "
+            "tokamax past the version that fixes this.",
+            compute_capability,
+        )
+
+
+# -----------------------------------------------------------------------------
 # Model Configuration and Runner
 # -----------------------------------------------------------------------------
 
@@ -736,16 +827,31 @@ class AlphaFold3Backend(FoldingBackend):
     @staticmethod
     def setup(
         num_diffusion_samples: int,
-        flash_attention_implementation: str,
         buckets: list,
         jax_compilation_cache_dir: str,
         model_dir: str,
+        flash_attention_implementation: str = "auto",
         num_recycles: int = 10,
         return_embeddings: bool = False,
         return_distogram: bool = False,
         **kwargs,
     ) -> Dict:
-        """Sets up the ModelRunner with the given configurations."""
+        """Sets up the ModelRunner with the given configurations.
+
+        Parameters
+        ----------
+        flash_attention_implementation : str, optional
+            Which tokamax dot-product-attention implementation to use:
+            "auto" (default), "triton", "cudnn", or "xla". "auto" picks
+            "triton" on Ampere+ (sm_80+), "cudnn" on Volta/Turing (sm_70+),
+            and "xla" otherwise or when no GPU is detected. Requesting
+            "triton" explicitly on a GPU older than sm_80 raises a clear
+            ValueError instead of failing later inside tokamax/Pallas.
+            Note: unlike AlphaFold2's triangle-multiplication
+            ``fuse_projection_weights``, there is no confirmed equivalent
+            "fused weights" toggle in AlphaFold3's config -- this parameter
+            only controls the attention kernel backend.
+        """
 
         # Suppose we rely on your new code's "model.Model" or a custom class
         from alphafold3.model.model import Model as MyNewModel
@@ -778,6 +884,7 @@ class AlphaFold3Backend(FoldingBackend):
             jax.config.update('jax_compilation_cache_dir', jax_compilation_cache_dir)
 
         gpu_devices = jax.local_devices(backend='gpu')
+        compute_capability = None
         if gpu_devices:
             compute_capability = float(gpu_devices[0].compute_capability)
             if compute_capability < 6.0:
@@ -792,6 +899,21 @@ class AlphaFold3Backend(FoldingBackend):
                         f' include "{required_flag}".'
                     )
         logging.info(f'Found local devices: {gpu_devices}')
+
+        resolved_flash_attention_implementation = _resolve_flash_attention_implementation(
+            flash_attention_implementation, compute_capability
+        )
+        _warn_if_blackwell_triton_regression(
+            resolved_flash_attention_implementation, compute_capability
+        )
+        logging.info(
+            "Using flash_attention_implementation=%r (requested %r) for "
+            "compute capability %s",
+            resolved_flash_attention_implementation,
+            flash_attention_implementation,
+            compute_capability,
+        )
+
         logging.info('Building model from scratch...')
 
         model_runner = ModelRunner(
@@ -799,7 +921,7 @@ class AlphaFold3Backend(FoldingBackend):
             config=make_model_config(
                 flash_attention_implementation=typing.cast(
                     tokamax.DotProductAttentionImplementation,
-                    flash_attention_implementation,
+                    resolved_flash_attention_implementation,
                 ),
                 num_diffusion_samples=num_diffusion_samples,
                 num_recycles=num_recycles,
