@@ -224,12 +224,12 @@ def _normalize_prediction_result(
     if isinstance(prediction_result, tuple):
         if len(prediction_result) == 2 and isinstance(prediction_result[0], Mapping):
             auxiliary_output = prediction_result[1]
-            logging.warning(
-                "Model %s returned a (prediction_result, auxiliary_output) tuple; "
-                "ignoring auxiliary output of type %s.",
-                model_name,
-                type(auxiliary_output).__name__,
-            )
+            #logging.warning(
+            #    "Model %s returned a (prediction_result, auxiliary_output) tuple; "
+            #    "ignoring auxiliary output of type %s.",
+            #    model_name,
+            #    type(auxiliary_output).__name__,
+            #)
             return dict(prediction_result[0])
 
         first_type = type(prediction_result[0]).__name__ if prediction_result else "n/a"
@@ -255,7 +255,7 @@ def _save_pae_json_file(pae: np.ndarray, max_pae: float, output_dir: str, model_
     output_dir: Directory to which files are saved.
     model_name: Name of a model.
     """
-    pae_json = confidence.pae_json(pae, max_pae)
+    pae_json = generate_pae_json(pae, max_pae)
     pae_json_output_path = os.path.join(output_dir, f'pae_{model_name}.json')
     with open(pae_json_output_path, 'w') as f:
         f.write(pae_json)
@@ -269,7 +269,7 @@ def _save_confidence_json_file(plddt: np.ndarray, output_dir: str, model_name: s
         output_dir: Directory to which files are saved.
         model_name: Name of a model.
     """
-    confidence_json = confidence.confidence_json(plddt)
+    confidence_json = generate_confidence_json(plddt)
     confidence_json_output_path = os.path.join(
         output_dir, f'confidence_{model_name}.json')
     with open(confidence_json_output_path, 'w') as f:
@@ -528,6 +528,65 @@ def _write_processed_template_debug_artifacts(
                 f"template {template_index}: {exc}"
             )
 
+def _confidence_category(score: float) -> str:
+  """Categorizes pLDDT into: disordered (D), low (L), medium (M), high (H)."""
+  if 0 <= score < 50:
+    return 'D'
+  if 50 <= score < 70:
+    return 'L'
+  elif 70 <= score < 90:
+    return 'M'
+  elif 90 <= score <= 100:
+    return 'H'
+  else:
+    raise ValueError(f'Invalid pLDDT score {score}')
+
+def generate_pae_json(pae: np.ndarray, max_pae: float) -> str:
+  """Returns the PAE in the same format as is used in the AFDB.
+
+  Note that the values are presented as floats to 1 decimal place, whereas AFDB
+  returns integer values.
+
+  Args:
+    pae: The n_res x n_res PAE array.
+    max_pae: The maximum possible PAE value.
+
+  Returns:
+    PAE output format as a JSON string.
+  """
+  # Check the PAE array is the correct shape.
+  if pae.ndim != 2 or pae.shape[0] != pae.shape[1]:
+    raise ValueError(f'PAE must be a square matrix, got {pae.shape}')
+
+  # Round the predicted aligned errors to 1 decimal place.
+  rounded_errors = np.round(pae.astype(np.float64), decimals=1)
+  formatted_output = [{
+      'predicted_aligned_error': rounded_errors.tolist(),
+      'max_predicted_aligned_error': max_pae,
+  }]
+  return json.dumps(formatted_output, indent=None, separators=(',', ':'))
+
+def generate_confidence_json(plddt: np.ndarray) -> str:
+  """Returns JSON with confidence score and category for every residue.
+
+  Args:
+    plddt: Per-residue confidence metric data.
+
+  Returns:
+    String with a formatted JSON.
+
+  Raises:
+    ValueError: If `plddt` has a rank different than 1.
+  """
+  if plddt.ndim != 1:
+    raise ValueError(f'The plddt array must be rank 1, got: {plddt.shape}.')
+
+  confidence = {
+      'residueNumber': list(range(1, len(plddt) + 1)),
+      'confidenceScore': [round(float(s), 2) for s in plddt],
+      'confidenceCategory': [_confidence_category(s) for s in plddt],
+  }
+  return json.dumps(confidence, indent=None, separators=(',', ':'))
 
 class AlphaFold2Backend(FoldingBackend):
     """
@@ -975,6 +1034,8 @@ class AlphaFold2Backend(FoldingBackend):
         Modified based on https://github.com/KosinskiLab/alphafold/blob/c844e1bb60a3beb50bb8d562c6be046da1e43e3d/alphafold/model/model.py#L31
         """
         if type(prediction_results['predicted_aligned_error']) == np.ndarray:
+            if prediction_results["ranking_confidence"] > 1 and multimer_mode :
+               prediction_results["ranking_confidence"] = prediction_results["ranking_confidence"]/100
             return prediction_results
         else:
             output = {}
@@ -985,7 +1046,6 @@ class AlphaFold2Backend(FoldingBackend):
                 breaks=prediction_results['predicted_aligned_error']['breaks'],
                 asym_id=None)
                 output['ptm'] = ptm
-
                 pae = confidence.compute_predicted_aligned_error(
                 logits=prediction_results['predicted_aligned_error']['logits'],
                 breaks=prediction_results['predicted_aligned_error']['breaks'])
@@ -1080,9 +1140,12 @@ class AlphaFold2Backend(FoldingBackend):
         total_num_res = sum([len(s) for s in multimeric_object.input_seqs]) if multimer_mode else len(multimeric_object.sequence)
         # Save plddt json files.
         for model_name, prediction_result in prediction_results.items():
+          
             prediction_result.update(AlphaFold2Backend.recalculate_confidence(prediction_result,multimer_mode,
                                                                          total_num_res))
             unrelaxed_protein = prediction_result.get("unrelaxed_protein")
+            
+
             if 'unrelaxed_protein' in prediction_result.keys():
                 unrelaxed_protein = prediction_result.pop("unrelaxed_protein")
             # Remove jax dependency from results
@@ -1103,7 +1166,8 @@ class AlphaFold2Backend(FoldingBackend):
                 cmplx = False
             plddt = prediction_result['plddt']
             _save_confidence_json_file(plddt, output_dir, model_name)
-            ranking_confidences[model_name] = prediction_result['ranking_confidence']
+            ranking_confidences[model_name] = float(prediction_result['ranking_confidence'])
+            print("ranking_confidences:",ranking_confidences)
             # Save and plot PAE if predicting multimer.
             if (
                     'predicted_aligned_error' in prediction_result
@@ -1112,9 +1176,7 @@ class AlphaFold2Backend(FoldingBackend):
                 pae = prediction_result['predicted_aligned_error']
 
                 max_pae = prediction_result['max_predicted_aligned_error']
-                _save_pae_json_file(pae, float(max_pae),
-                                    output_dir, model_name)
-
+                _save_pae_json_file(pae, float(max_pae),output_dir, model_name)
         # Rank by model confidence.
         ranked_order = [
             model_name for model_name, confidence in
@@ -1132,7 +1194,7 @@ class AlphaFold2Backend(FoldingBackend):
                 ranking=idx
             )
 
-        # Save ranking_debug.json.
+        # Save ranking_debug.json
         with open(ranking_path, 'w') as f:
             json.dump(
                 {label: ranking_confidences, 'order': ranked_order,
