@@ -1167,7 +1167,6 @@ class AlphaFold2Backend(FoldingBackend):
             plddt = prediction_result['plddt']
             _save_confidence_json_file(plddt, output_dir, model_name)
             ranking_confidences[model_name] = float(prediction_result['ranking_confidence'])
-            print("ranking_confidences:",ranking_confidences)
             # Save and plot PAE if predicting multimer.
             if (
                     'predicted_aligned_error' in prediction_result
