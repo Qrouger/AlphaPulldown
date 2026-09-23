@@ -1084,7 +1084,7 @@ class AlphaFold2Backend(FoldingBackend):
         remove_pickles: bool = False,
         remove_keys_from_pickles: bool = False,
         storage_mode: str = "vanilla",
-        convert_to_modelcif: bool = True,
+        convert_to_modelcif: bool = False,
         use_gpu_relax: bool = True,
         pae_plot_style: str = "red_blue",
 
