@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "alphapulldown"
 description = "Pipeline allows massive screening using alphafold"
 readme = { file = "README.md", content-type = "text/markdown" }
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [
@@ -14,6 +14,9 @@ authors = [
 ]
 classifiers = [
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
   "Operating System :: OS Independent",
 ]
 dynamic = ["version"]
@@ -84,6 +87,15 @@ packages = [
   "alphapulldown.folding_backend",
   "alphapulldown.analysis_pipeline",
   "alphapulldown.scripts",
+  "alphafold",
+  "alphafold.data",
+  "alphafold.data.tools",
+  "alphafold.common",
+  "alphafold.relax",
+  "alphafold.model",
+  "alphafold.model.geometry",
+  "alphafold.model.tf",
+  "alphafold.notebooks",
   "alphafold3",
   "alphafold3.structure",
   "colabfold",
@@ -122,6 +134,8 @@ script-files = [
 "" = "."
 "alphapulldown" = "./alphapulldown"
 "alphapulldown.folding_backend" = "./alphapulldown/folding_backend"
+"alphafold" = "./alphafold/alphafold"
+"alphafold3" = "./alphafold3/src/alphafold3"
 "alphafold3.structure" = "./alphafold3/src/alphafold3/structure"
 "colabfold" = "./ColabFold/colabfold"
 "analysis_pipeline" = "./alphapulldown/analysis_pipeline"
