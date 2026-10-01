@@ -3,7 +3,7 @@
 # A script containing utility functions
 #
 from alphapulldown import __version__ as AP_VERSION
-from alphafold.version import __version__ as AF_VERSION
+#from alphafold.version import __version__ as AF_VERSION
 import os
 from absl import logging
 import subprocess
@@ -250,7 +250,7 @@ def get_meta_dict(flag_dict):
     metadata = {
         "databases": {},
         "software": {"AlphaPulldown": {"version": AP_VERSION},
-                     "AlphaFold": {"version": AF_VERSION}},
+                     "AlphaFold": {"version": "2.3.2"}},
         "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "other": {},
     }
