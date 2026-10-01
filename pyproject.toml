@@ -84,7 +84,6 @@ packages = [
   "alphapulldown.folding_backend",
   "alphapulldown.analysis_pipeline",
   "alphapulldown.scripts",
-  "alphafold.version",
   "alphafold3",
   "alphafold3.structure",
   "colabfold",
@@ -124,7 +123,6 @@ script-files = [
 "alphapulldown" = "./alphapulldown"
 "alphapulldown.folding_backend" = "./alphapulldown/folding_backend"
 "alphafold3.structure" = "./alphafold3/src/alphafold3/structure"
-"alphafold" = "./alphafold/alphafold"
 "colabfold" = "./ColabFold/colabfold"
 "analysis_pipeline" = "./alphapulldown/analysis_pipeline"
 "af2plots" = "./alphapulldown/analysis_pipeline/af2plots/af2plots"
