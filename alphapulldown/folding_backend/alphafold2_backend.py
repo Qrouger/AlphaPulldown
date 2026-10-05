@@ -24,6 +24,7 @@ from alphapulldown.objects import MultimericObject, MonomericObject, ChoppedObje
 from alphapulldown.utils.post_modelling import post_prediction_process
 #from alphapulldown.utils.calculate_rmsd import calculate_rmsd_and_superpose
 from alphapulldown.utils.modelling_setup import pad_input_features
+from alphapulldown.prediction.jax_compilation_cache import enable_persistent_compilation_cache
 from alphapulldown.utils.af2_to_af3_msa import msa_rows_and_deletions_to_a3m
 from alphafold.relax import relax
 from alphafold.common import protein, residue_constants, confidence
@@ -671,15 +672,8 @@ class AlphaFold2Backend(FoldingBackend):
 
         # AlphaFold2 inference is JAX-compiled, and a fresh process recompiles every
         # model runner. Honour a persistent on-disk compile cache when one is given.
-        jax_compilation_cache_dir = os.environ.get("JAX_COMPILATION_CACHE_DIR")
-        if jax_compilation_cache_dir:
-            import jax
-
-            jax.config.update(
-                "jax_compilation_cache_dir", str(jax_compilation_cache_dir)
-            )
-            jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
-            jax.config.update("jax_persistent_cache_min_entry_size_bytes", 0)
+        enable_persistent_compilation_cache(os.environ.get("JAX_COMPILATION_CACHE_DIR"))
+        
 
         if kernel_backend != "auto" and not use_fast_kernels:
             logging.warning("kernel_backend has no effect without use_fast_kernels")
