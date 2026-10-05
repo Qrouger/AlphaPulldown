@@ -671,7 +671,7 @@ class AlphaFold2Backend(FoldingBackend):
 
         # AlphaFold2 inference is JAX-compiled, and a fresh process recompiles every
         # model runner. Honour a persistent on-disk compile cache when one is given.
-        jax_compilation_cache_dir = kwargs.get("jax_compilation_cache_dir")
+        jax_compilation_cache_dir = os.environ.get("JAX_COMPILATION_CACHE_DIR")
         if jax_compilation_cache_dir:
             import jax
 
