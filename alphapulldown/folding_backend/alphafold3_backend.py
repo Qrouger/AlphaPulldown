@@ -21,7 +21,7 @@ import time
 import typing
 from collections import Counter
 from collections.abc import Sequence
-from typing import Any, List, Dict, Union, overload
+from typing import Any, List, Dict, Mapping, Union, overload
 
 import alphafold3.cpp
 import haiku as hk
@@ -112,6 +112,245 @@ class ResultsForSeed:
 
 
 # -----------------------------------------------------------------------------
+# Fused triangle kernels (fast_kernels)
+# -----------------------------------------------------------------------------
+# --fast_kernels turns on fused Pallas kernels for the triangle multiplication and
+# triangle attention layers of AF3's pair stack. They ship with KosinskiLab's AlphaFold 3
+# fork (``alphafold3.jax.fused_triangle``).
+#
+# The fork decides per layer: a layer outside the measured GPUs, dtype, shapes or size
+# limits runs the original module body. The device is checked once, before the model is
+# built, and both kernels are run on it, so that a GPU, driver or JAX that cannot compile
+# them fails now rather than in the middle of a prediction:
+#
+#   * "off":  the original AF3 layers, exactly as before.
+#   * "on":   the kernels wherever a layer qualifies, or a ValueError saying why this
+#             device cannot run them.
+#   * "auto": as "on" where the device can run them, the original layers (with a log
+#             line) elsewhere.
+
+_FUSED_TRIANGLE_OPERATIONS = ("triangle_multiplication", "triangle_attention")
+# Pair channels of AF3's triangle layers: 128 in the pair stack, 64 in the template stack.
+_FUSED_TRIANGLE_RECORDED_NUM_CHANNELS = (128, 64)
+
+
+@dataclasses.dataclass(frozen=True)
+class FusedTriangleChoice:
+    """What the fast_kernels resolution decided for AF3's triangle layers, and why."""
+
+    enabled: bool
+    reason: str
+    mode: str = "off"
+    settings: Mapping[str, Any] = dataclasses.field(default_factory=dict)
+
+    def global_config_update(self) -> dict[str, Any]:
+        """Fields for AF3's ``GlobalConfig``; empty when the kernels are off."""
+        return dict(self.settings) if self.enabled else {}
+
+
+FUSED_TRIANGLES_OFF = FusedTriangleChoice(False, "--fast_kernels=off")
+
+
+def _normalise_fast_kernels_mode(mode: Any) -> str:
+    """Maps a --fast_kernels value (str or bool) to "off", "on" or "auto"."""
+    if mode is None or mode is False:
+        return "off"
+    if mode is True:
+        return "on"
+    value = str(mode).strip().lower()
+    if value in {"off", "false", "0", "no", "none", ""}:
+        return "off"
+    if value in {"on", "true", "1", "yes"}:
+        return "on"
+    if value == "auto":
+        return "auto"
+    raise ValueError(
+        f"Unknown --fast_kernels value {mode!r}; expected one of: off, on, auto."
+    )
+
+
+def _fused_triangle_device_settings(device: jax.Device) -> dict[str, Any]:
+    """The ``GlobalConfig`` fields that turn the kernels on for ``device``.
+
+    The fork's policy reads the device's compute capability and its JAX allocator budget,
+    which set the per-operation size limits. No model parameters are loaded.
+
+    Raises:
+        RuntimeError: if the installed AF3 has no fused-triangle hooks, or the fork's
+            policy does not enable the kernels on ``device``.
+    """
+    from alphafold3.model import model_config
+
+    if not hasattr(model_config.GlobalConfig(), "triangle_multiplication_implementation"):
+        raise RuntimeError(
+            "this AlphaFold 3 installation has no fused-triangle hooks "
+            "(alphafold3.jax.fused_triangle); install the KosinskiLab alphafold3 fork"
+        )
+    from alphafold3.jax.fused_triangle import dispatch
+
+    memory_gib = (device.memory_stats() or {}).get("bytes_limit", 0) / 2**30
+    policy = dispatch.device_policy(getattr(device, "compute_capability", ""), memory_gib)
+    if not policy.enabled:
+        raise RuntimeError(f"{getattr(device, 'device_kind', 'GPU')}: {policy.reason}")
+    return {
+        "triangle_multiplication_implementation": "pallas",
+        "triangle_attention_implementation": "auto",
+        "fused_triangle_compute_capability": policy.compute_capability,
+        "fused_triangle_memory_gib": memory_gib,
+    }
+
+
+def _fused_triangle_smoke_test(
+    settings: Mapping[str, Any], device: jax.Device
+) -> None:
+    """Compile and run both fused triangle layers on ``device``, without model weights.
+
+    One 64-token, 128-channel pair goes through TriangleMultiplication and then
+    GridSelfAttention, configured with ``settings``.
+
+    Raises:
+        RuntimeError: if the output is not finite. Whatever compiling or running the
+            kernels raises is passed on.
+    """
+    from alphafold3.model import model_config
+    from alphafold3.model.components import utils as af3_utils
+    from alphafold3.model.network import modules
+
+    global_config = model_config.GlobalConfig(final_init="linear", **settings)
+
+    def forward(act, mask):
+        with af3_utils.bfloat16_context():
+            act = modules.TriangleMultiplication(
+                modules.TriangleMultiplication.Config(equation="ikc,jkc->ijc"),
+                global_config,
+                name="triangle_multiplication",
+            )(act, mask)
+            return modules.GridSelfAttention(
+                modules.GridSelfAttention.Config(),
+                global_config,
+                transpose=True,
+                name="triangle_attention",
+            )(act, mask)
+
+    transformed = hk.without_apply_rng(hk.transform(forward))
+    with jax.default_device(device):
+        act = jnp.ones((64, 64, 128), jnp.bfloat16)
+        mask = jnp.ones((64, 64), jnp.bfloat16)
+        params_ = transformed.init(jax.random.PRNGKey(0), act, mask)
+        output = jax.jit(transformed.apply)(params_, act, mask)
+        finite = bool(jnp.all(jnp.isfinite(output)))
+    if not finite:
+        raise RuntimeError("the fused triangle layers returned non-finite values")
+
+
+def _fused_triangle_fall_back(
+    mode: str, problem: str, exc: Exception, *, self_check: bool = False
+) -> FusedTriangleChoice:
+    """Raise for "on"; for "auto", log ``problem`` and keep the original layers.
+
+    A device without support is expected, so it is a warning. Kernels that fail their
+    self-check on a supported device are a bug that must not pass unnoticed, so that is
+    an error, with the traceback.
+    """
+    if mode == "on":
+        raise ValueError(f"--fast_kernels=on, but {problem}.") from exc
+    if self_check:
+        logging.error(
+            "Fused kernels off (--fast_kernels=auto): %s.", problem, exc_info=exc
+        )
+    else:
+        logging.warning("Fused kernels off (--fast_kernels=auto): %s.", problem)
+    return FusedTriangleChoice(False, f"--fast_kernels=auto: {problem}", mode)
+
+
+def _resolve_fused_triangles(mode: Any, device: jax.Device) -> FusedTriangleChoice:
+    """Turn a --fast_kernels value into a decision for ``device``, checking it first.
+
+    Raises:
+        ValueError: for an unknown mode, or for "on" when the kernels are not supported
+            on ``device`` or fail their self-check there; the message says which.
+    """
+    mode = _normalise_fast_kernels_mode(mode)
+    if mode == "off":
+        return FUSED_TRIANGLES_OFF
+    try:
+        settings = _fused_triangle_device_settings(device)
+    except Exception as exc:  # no hooks, or a device the fork's policy does not enable
+        return _fused_triangle_fall_back(
+            mode, f"AF3 fused triangle kernels are not supported here: {exc}", exc
+        )
+    try:
+        _fused_triangle_smoke_test(settings, device)
+    except Exception as exc:  # any failure here would recur inside the model
+        return _fused_triangle_fall_back(
+            mode,
+            f"AF3 fused triangle kernels failed their self-check: "
+            f"{type(exc).__name__}: {exc}",
+            exc,
+            self_check=True,
+        )
+    logging.info(
+        "AF3 fused triangle kernels on; per-operation size limits apply: %s", settings
+    )
+    return FusedTriangleChoice(True, f"--fast_kernels={mode}", mode, settings)
+
+
+def _fused_triangle_metadata(
+    global_config: Any, choice: FusedTriangleChoice, *, num_tokens: int
+) -> dict[str, Any]:
+    """Which implementation AF3's triangle layers dispatch to for one padded bucket.
+
+    Lists the 128-channel pair stack and the 64-channel template stack. Dispatch depends
+    only on ``global_config`` and the shapes, so the record also holds when a compiled
+    model comes from the compile cache. It does not claim that templates were supplied.
+    """
+    record = {
+        "backend": "alphafold3",
+        "requested_mode": choice.mode,
+        "padded_tokens": num_tokens,
+        "fused_kernels": False,
+        "reason": choice.reason,
+    }
+    requested = {
+        operation: getattr(global_config, f"{operation}_implementation", "default")
+        for operation in _FUSED_TRIANGLE_OPERATIONS
+    }
+    if all(implementation == "default" for implementation in requested.values()):
+        return record
+    from alphafold3.jax.fused_triangle import dispatch
+
+    policy = dispatch.device_policy(
+        global_config.fused_triangle_compute_capability,
+        global_config.fused_triangle_memory_gib,
+    )
+    dtype = "float32" if global_config.bfloat16 == "none" else "bfloat16"
+    operations = {}
+    for num_channels in _FUSED_TRIANGLE_RECORDED_NUM_CHANNELS:
+        for operation, implementation in requested.items():
+            selected, reason = dispatch.select_implementation(
+                operation,
+                implementation,
+                policy,
+                (num_tokens, num_tokens, num_channels),
+                dtype,
+                (num_tokens, num_tokens),
+            )
+            operations[f"{operation}_c{num_channels}"] = {
+                "implementation": selected,
+                "reason": reason,
+            }
+    record.update(
+        fused_kernels=any(
+            operation["implementation"] != "default" for operation in operations.values()
+        ),
+        operations=operations,
+        policy_version=dispatch.POLICY_VERSION,
+        device_policy=dataclasses.asdict(policy),
+    )
+    return record
+
+
+# -----------------------------------------------------------------------------
 # Model Configuration and Runner
 # -----------------------------------------------------------------------------
 
@@ -122,6 +361,7 @@ class ModelRunner:
     config: base_config.BaseConfig
     device: jax.Device
     model_dir: pathlib.Path
+    fused_triangles: FusedTriangleChoice = FUSED_TRIANGLES_OFF
 
     @functools.cached_property
     def model_params(self) -> hk.Params:
@@ -566,6 +806,50 @@ def _sequential_residue_ids_per_chain(chain_ids: Sequence[str]) -> list[int]:
     return residue_ids
 
 
+def _record_inference_kernels(
+    output_dir: os.PathLike[str] | str,
+    seed: int,
+    model_runner: ModelRunner,
+    example: features.BatchDict,
+) -> None:
+    """Record in inference_kernels.json which kernels a seed's triangle layers ran.
+
+    Fused and original layers differ slightly in their numerics, so the record lets
+    ranking and analysis tell them apart. Entries are keyed ``seed-N`` like AF3's other
+    outputs and are read back from the runner's own config, so they state what actually
+    ran. The record never fails a finished prediction: an unreadable file is replaced,
+    and any other failure is logged and skipped.
+    """
+    fused_triangles = getattr(model_runner, "fused_triangles", None)
+    tokens = example.get("token_index", example.get("aatype"))
+    if fused_triangles is None or tokens is None:  # not an AF3 runner (e.g. a test double)
+        return
+    key = f"seed-{seed}"
+    try:
+        record = _fused_triangle_metadata(
+            model_runner.config.global_config, fused_triangles, num_tokens=int(tokens.shape[0])
+        )
+    except Exception as exc:  # provenance only; the prediction itself succeeded
+        logging.warning("Not recording the inference kernels of %s: %s", key, exc)
+        return
+    path = pathlib.Path(output_dir) / "inference_kernels.json"
+    try:
+        records = json.loads(path.read_text()) if path.exists() else {}
+        if not isinstance(records, dict):
+            raise ValueError("not a JSON object")
+    except (OSError, ValueError) as exc:
+        logging.warning("Replacing unreadable %s: %s", path, exc)
+        records = {}
+    records[key] = record
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        temporary = path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(records, indent=2, sort_keys=True) + "\n")
+        temporary.replace(path)
+    except OSError as exc:
+        logging.warning("Not recording the inference kernels of %s: %s", key, exc)
+
+
 def predict_structure(
     fold_input: folding_input.Input,
     model_runner: ModelRunner,
@@ -637,6 +921,8 @@ def predict_structure(
         logging.info(
             f'Extracting structures for seed {seed} took {time.time() - extract_start:.2f} seconds.'
         )
+        if output_dir is not None:
+            _record_inference_kernels(output_dir, seed, model_runner, example)
 
         # Optional: gather embeddings and distogram
         embeddings_out = None
@@ -763,6 +1049,7 @@ class AlphaFold3Backend(FoldingBackend):
         num_recycles: int = 10,
         return_embeddings: bool = False,
         return_distogram: bool = False,
+        fast_kernels: str = "off",
         **kwargs,
     ) -> Dict:
         """Sets up the ModelRunner with the given configurations."""
@@ -778,11 +1065,14 @@ class AlphaFold3Backend(FoldingBackend):
             num_recycles: int = 10,
             return_embeddings: bool = False,
             return_distogram: bool = False,
+            global_config_update: Dict[str, Any],
         ):
             # The new code approach:
             config = model_class.Config()
             if hasattr(config, 'global_config'):
                 config.global_config.flash_attention_implementation = flash_attention_implementation
+                for key, value in global_config_update.items():
+                    setattr(config.global_config, key, value)
             if hasattr(config, 'heads') and hasattr(config.heads, 'diffusion'):
                 config.heads.diffusion.eval.num_samples = num_diffusion_samples
             # Optional overrides present in upstream AF3 runner
@@ -812,6 +1102,7 @@ class AlphaFold3Backend(FoldingBackend):
                         f' include "{required_flag}".'
                     )
         logging.info(f'Found local devices: {gpu_devices}')
+        fused_triangles = _resolve_fused_triangles(fast_kernels, gpu_devices[0])
         logging.info('Building model from scratch...')
 
         model_runner = ModelRunner(
@@ -825,9 +1116,11 @@ class AlphaFold3Backend(FoldingBackend):
                 num_recycles=num_recycles,
                 return_embeddings=return_embeddings,
                 return_distogram=return_distogram,
+                global_config_update=fused_triangles.global_config_update(),
             ),
             device=gpu_devices[0],
             model_dir=pathlib.Path(model_dir),
+            fused_triangles=fused_triangles,
         )
         return {'model_runner': model_runner}
 
