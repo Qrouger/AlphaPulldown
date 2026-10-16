@@ -973,14 +973,14 @@ class AlphaFold2Backend(FoldingBackend):
                 b_factors=plddt_b_factors,
                 remove_leading_feature_dimension=not model_runner.multimer_mode,
             )
-            # Remove jax dependency from results
-            np_prediction_result = _jnp_to_np(dict(prediction_result))
-            # Save prediction results to pickle file
+            # Convert to NumPy and drop the references to the JAX arrays
+            prediction_result = _jnp_to_np(prediction_result)
+            # Save prediction results to pickle file (before adding seqs / protein)
             result_output_path = os.path.join(output_dir, f"result_{model_name}.pkl")
             with open(result_output_path, "wb") as f:
-                 pickle.dump(np_prediction_result, f, protocol=4)
+                pickle.dump(prediction_result, f, protocol=4)
             prediction_result.update(
-                        {"seqs": multimeric_object.input_seqs if hasattr(multimeric_object,"input_seqs") else [multimeric_object.sequence]})
+                {"seqs": multimeric_object.input_seqs if hasattr(multimeric_object, "input_seqs") else [multimeric_object.sequence]})
             prediction_result.update({"unrelaxed_protein": unrelaxed_protein})
             prediction_results.update({model_name: prediction_result})
             # Save predictions to pdb files
