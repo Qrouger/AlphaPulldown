@@ -127,7 +127,7 @@ flags.DEFINE_integer('random_seed', None, 'The random seed for the data '
                      'that even if this is set, Alphafold may still not be '
                      'deterministic, because processes like GPU inference are '
                      'nondeterministic.')
-flags.DEFINE_boolean('convert_to_modelcif', True,
+flags.DEFINE_boolean('convert_to_modelcif', False,
                      'Whether to convert predicted pdb files to modelcif format. Default True.')
 flags.DEFINE_boolean('allow_resume', True,
                      'Whether to resume what earlier runs left in the output directory or start '
