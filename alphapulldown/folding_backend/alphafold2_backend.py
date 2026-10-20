@@ -215,6 +215,20 @@ def _jnp_to_np(output):
     return output
 
 
+# Large outputs (N x N x 64 for most) that postprocess does not need; they stay in result_<model>.pkl.
+_HEAVY_RESULT_KEYS = (
+    "distogram", "masked_msa", "experimentally_resolved",
+    "predicted_lddt", "structure_module", "aligned_confidence_probs",
+)
+
+
+def _drop_heavy_outputs(prediction_result: Dict) -> Dict:
+    """Drops the large outputs from a result kept in memory until postprocess."""
+    for key in _HEAVY_RESULT_KEYS:
+        prediction_result.pop(key, None)
+    return prediction_result
+
+
 def _normalize_prediction_result(
     prediction_result: Any, *, model_name: str
 ) -> Dict[str, Any]:
@@ -856,28 +870,12 @@ class AlphaFold2Backend(FoldingBackend):
                                 {"seqs": multimeric_object.input_seqs if hasattr(multimeric_object, "input_seqs") else [
                                     multimeric_object.sequence]})
                         if "unrelaxed_protein" not in prediction_result.keys():
-                            plddt_b_factors = np.repeat(
-                                prediction_result['plddt'][:,
-                                None], residue_constants.atom_type_num, axis=-1
-                            )
-                            model_random_seed = model_index + random_seed * len(model_runners)
-                            logging.info(f"Running prediction using model {model_name} "
-                                         f"and random seed: {model_random_seed}")
-                            processed_feature_dict = model_runner.process_features(
-                                original_feature_dict, random_seed=model_random_seed
-                            )
-                            normalized_feature_dict = _normalize_asym_id(
-                                processed_feature_dict, fallback_feature_dict=original_feature_dict
-                            )
-                            unrelaxed_protein = protein.from_prediction(
-                                features=normalized_feature_dict,
-                                result=prediction_result,
-                                b_factors=plddt_b_factors,
-                                remove_leading_feature_dimension=not model_runner.multimer_mode,
-                            )
+                            # Read the PDB rather than process the features again to rebuild it.
+                            with open(unrelaxed_pdb_path, "r") as pdb:
+                                unrelaxed_protein = protein.from_pdb_string(pdb.read())
                             prediction_result.update(
                                 {"unrelaxed_protein": unrelaxed_protein})
-                    prediction_results.update({model_name: prediction_result})
+                    prediction_results.update({model_name: _drop_heavy_outputs(prediction_result)})
                     START = model_index + 1
                 else:
                     break
@@ -904,13 +902,13 @@ class AlphaFold2Backend(FoldingBackend):
         num_models = len(model_runners)
         # Predict
         for model_index, (model_name, model_runner) in enumerate(model_runners.items()):
+            # Skip if results.pkl und unrelaxed.pdb are exist
+            if model_index < START: continue
             t_0 = time.time()
             model_random_seed = model_index + random_seed * num_models
             processed_feature_dict = model_runner.process_features(
                 original_feature_dict, random_seed=model_random_seed
             )
-            # Skip if results.pkl und unrelaxed.pdb are exist
-            if model_index < START: continue
             # TODO: re-predict models if --allow_resume and previous predictions were done with templates
             if skip_templates:
                 _reset_template_features(processed_feature_dict)
@@ -982,7 +980,7 @@ class AlphaFold2Backend(FoldingBackend):
             prediction_result.update(
                 {"seqs": multimeric_object.input_seqs if hasattr(multimeric_object, "input_seqs") else [multimeric_object.sequence]})
             prediction_result.update({"unrelaxed_protein": unrelaxed_protein})
-            prediction_results.update({model_name: prediction_result})
+            prediction_results.update({model_name: _drop_heavy_outputs(prediction_result)})
             # Save predictions to pdb files
             unrelaxed_pdb_path = os.path.join(
                 output_dir, f"unrelaxed_{model_name}.pdb")
@@ -1142,12 +1140,19 @@ class AlphaFold2Backend(FoldingBackend):
 
             if 'unrelaxed_protein' in prediction_result.keys():
                 unrelaxed_protein = prediction_result.pop("unrelaxed_protein")
-            # Remove jax dependency from results
-            np_prediction_result = _jnp_to_np(dict(prediction_result))
-            # Save prediction results to pickle file
+            # Save prediction results to pickle file. The result in memory lacks the
+            # large outputs: take them from the pickle on disk, one model at a time.
             result_output_path = os.path.join(output_dir, f"result_{model_name}.pkl")
+            full_result = {}
+            if os.path.exists(result_output_path):
+                with open(result_output_path, "rb") as f:
+                    full_result = pickle.load(f)
+            full_result.update(prediction_result)
+            # Remove jax dependency from results
+            np_prediction_result = _jnp_to_np(full_result)
             with open(result_output_path, "wb") as f:
                 pickle.dump(np_prediction_result, f, protocol=4)
+            del full_result, np_prediction_result
             if unrelaxed_protein is not None:
                 prediction_results[model_name]['unrelaxed_protein'] = unrelaxed_protein
             if 'iptm' in prediction_result:
