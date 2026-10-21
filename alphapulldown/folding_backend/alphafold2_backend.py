@@ -6,10 +6,13 @@
             Dmitry Molodenskiy <dmitry.molodenskiy@embl-hamburg.de> 
             Dingquan Yu <dingquan.yu@embl-hamburg.de>
 """
+import contextlib
+import gc
 import time
 import json
 import pickle
 import subprocess
+import sys
 import enum
 import typing
 from collections.abc import Mapping
@@ -39,6 +42,9 @@ RELAX_ENERGY_TOLERANCE = 2.39
 RELAX_STIFFNESS = 10.0
 RELAX_EXCLUDE_RESIDUES = []
 RELAX_MAX_OUTER_ITERATIONS = 3
+# Rows of the PAE computed at a time: bounds the probabilities held in memory to
+# PAE_ROW_CHUNK_SIZE x N x bins instead of N x N x bins.
+PAE_ROW_CHUNK_SIZE = 128
 
 
 def _select_models_to_relax(
@@ -229,6 +235,280 @@ def _drop_heavy_outputs(prediction_result: Dict) -> Dict:
     return prediction_result
 
 
+@contextlib.contextmanager
+def _open_atomic(path: str, mode: str = "w"):
+    """Write to a temporary file next to ``path``, renamed over it once complete.
+
+    A job killed mid-write (systemd-oomd kills the whole process group) then never
+    leaves a truncated pickle or PDB that a resumed run would trust.
+    """
+    tmp_path = f"{path}.tmp.{os.getpid()}"
+    try:
+        with open(tmp_path, mode) as f:
+            yield f
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+def _dump_pickle(obj: Dict, path: str) -> None:
+    """Protocol 5 writes NumPy arrays from their own memory; protocol 4 first copies
+    every array into the pickler's memo, doubling the result in RAM."""
+    with _open_atomic(path, "wb") as f:
+        pickle.dump(obj, f, protocol=5)
+
+
+def _calculate_bin_centers(breaks: np.ndarray) -> np.ndarray:
+    """As alphafold.common.confidence: bin centres, plus a catch-all last bin."""
+    step = breaks[1] - breaks[0]
+    bin_centers = breaks + step / 2
+    return np.concatenate([bin_centers, [bin_centers[-1] + step]], axis=0)
+
+
+def _aligned_error_scores(
+    *,
+    breaks: np.ndarray,
+    logits: np.ndarray = None,
+    probs: np.ndarray = None,
+    asym_id: np.ndarray = None,
+    row_chunk_size: int = PAE_ROW_CHUNK_SIZE,
+) -> Dict[str, Any]:
+    """PAE matrix, pTM and (with ``asym_id``) ipTM from the PAE head, block by block.
+
+    The formulas are those of alphafold.common.confidence
+    (compute_predicted_aligned_error and predicted_tm_score with unit residue
+    weights), but every quantity of a residue pair depends only on its row, so the
+    rows are processed ``row_chunk_size`` at a time. The softmax of the whole
+    N x N x bins logits, and the temporaries of the same size that scipy and NumPy
+    create around it, are never held at once.
+
+    Pass either the head's ``logits`` or its already normalised ``probs``.
+    """
+    source = logits if logits is not None else probs
+    num_res = source.shape[0]
+    bin_centers = _calculate_bin_centers(np.asarray(breaks, dtype=np.float64))
+    if source.shape[-1] != bin_centers.size:
+        raise ValueError(
+            f"PAE head has {source.shape[-1]} bins but its breaks give {bin_centers.size}")
+    # d_0(num_res) of the TM-score, eqn. (5) in Yang & Skolnick (2004).
+    d0 = 1.24 * (max(num_res, 19) - 15) ** (1.0 / 3) - 1.8
+    tm_per_bin = 1.0 / (1 + np.square(bin_centers) / np.square(d0))
+    if asym_id is not None:
+        asym_id = np.asarray(asym_id).reshape(-1)[:num_res]
+
+    pae = np.empty((num_res, num_res), dtype=np.float32)
+    ptm_per_row = np.empty(num_res)
+    iptm_per_row = np.empty(num_res) if asym_id is not None else None
+    for start in range(0, num_res, row_chunk_size):
+        stop = min(start + row_chunk_size, num_res)
+        block = np.array(source[start:stop], dtype=np.float32)
+        if logits is not None:
+            block -= block.max(axis=-1, keepdims=True)
+            np.exp(block, out=block)
+            block /= block.sum(axis=-1, keepdims=True)
+        pae[start:stop] = block @ bin_centers
+        tm_term = block @ tm_per_bin  # [rows, num_res]
+        del block
+        ptm_per_row[start:stop] = tm_term.sum(axis=-1) / (1e-8 + num_res)
+        if asym_id is not None:
+            pair_mask = asym_id[start:stop, None] != asym_id[None, :]
+            iptm_per_row[start:stop] = (
+                (tm_term * pair_mask).sum(axis=-1) / (1e-8 + pair_mask.sum(axis=-1)))
+    scores = {
+        "predicted_aligned_error": pae,
+        "max_predicted_aligned_error": np.asarray(bin_centers[-1]),
+        "ptm": np.asarray(ptm_per_row.max()),
+    }
+    if iptm_per_row is not None:
+        scores["iptm"] = np.asarray(iptm_per_row.max())
+    return scores
+
+
+def _finalize_scores(
+    result: Dict,
+    *,
+    multimer_mode: bool,
+    total_num_res: int,
+    asym_id: np.ndarray = None,
+) -> bool:
+    """Bring one prediction's scores to their final form, in place.
+
+    - PAE still as the head's raw output (logits): compute the PAE matrix, pTM and
+      ipTM from it with ``_aligned_error_scores``.
+    - Padded prediction (``--desired_num_res``): pLDDT and the PAE arrays are cut to
+      the real residues, and pTM/ipTM recomputed over them from
+      ``aligned_confidence_probs``.
+    - Multimer ranking on ColabFold's 0-100 scale: brought to 0-1.
+
+    Idempotent. Returns whether anything changed, i.e. whether a pickle written
+    before needs rewriting.
+    """
+    n = int(total_num_res)
+    plddt = np.asarray(result["plddt"])
+    padded = plddt.shape[0] > n
+    pae_entry = result.get("predicted_aligned_error")
+    scores = None
+    if isinstance(pae_entry, Mapping):
+        if asym_id is None:
+            asym_id = pae_entry.get("asym_id")
+        scores = _aligned_error_scores(
+            logits=np.asarray(pae_entry["logits"])[:n, :n],
+            breaks=np.asarray(pae_entry["breaks"]),
+            asym_id=asym_id if multimer_mode else None,
+        )
+    elif padded and "aligned_confidence_probs" in result:
+        probs = np.asarray(result["aligned_confidence_probs"])[:n, :n]
+        num_bins = probs.shape[-1]
+        max_pae = float(result["max_predicted_aligned_error"])
+        # AlphaFold's bins: edges 0, s, 2s, ... and a catch-all bin, whose centre
+        # (the maximum predicted error) is (num_bins - 0.5) * s.
+        step = max_pae / (num_bins - 0.5)
+        scores = _aligned_error_scores(
+            probs=probs,
+            breaks=np.arange(num_bins - 1) * step,
+            asym_id=asym_id if multimer_mode else None,
+        )
+        result["aligned_confidence_probs"] = probs
+    elif padded:
+        logging.warning(
+            "Padded prediction without aligned_confidence_probs: pLDDT and PAE are "
+            "cut to the real residues, but pTM and ipTM keep the model's values.")
+        if isinstance(pae_entry, np.ndarray):
+            result["predicted_aligned_error"] = pae_entry[:n, :n]
+
+    changed = scores is not None or padded
+    if scores is not None:
+        if multimer_mode and "iptm" not in scores:
+            logging.warning("No chain IDs to recompute ipTM; keeping the model's value.")
+        result.update(scores)
+    if padded:
+        result["plddt"] = plddt[:n]
+    if not multimer_mode:
+        if changed:
+            # Monomer models rank by mean pLDDT.
+            result["ranking_confidence"] = np.mean(np.asarray(result["plddt"]))
+    elif scores is not None and "iptm" in scores:
+        result["ranking_confidence"] = 0.8 * result["iptm"] + 0.2 * result["ptm"]
+    elif result.get("ranking_confidence", 0) > 1:
+        result["ranking_confidence"] = result["ranking_confidence"] / 100
+        changed = True
+    return changed
+
+
+def _residue_b_factors(pdb_path: str) -> List[str]:
+    """Each residue's B-factor: AlphaFold's pLDDT."""
+    values = []
+    last_residue = None
+    with open(pdb_path, "r") as f:
+        for line in f:
+            if line.startswith("ATOM"):
+                residue = line[21:27]  # chain ID, residue number and insertion code
+                if residue != last_residue:
+                    values.append(line[60:66].strip())
+                    last_residue = residue
+    return values
+
+
+def _pdb_holds_prediction(pdb_path: str, prediction_result: Dict) -> bool:
+    """Whether unrelaxed_<model>.pdb holds this pickle's model: its B-factors are the
+    pickle's pLDDT. Only the real residues are compared, which come before any
+    padding, and the pickle's pLDDT may already be cut to them."""
+    b_factors = _residue_b_factors(pdb_path)
+    plddt = np.asarray(prediction_result.get("plddt", ()))
+    n = min(len(b_factors), len(plddt))
+    return n > 0 and b_factors[:n] == [f"{value:.2f}" for value in plddt[:n]]
+
+
+def _msa_depths(
+    evoformer_config: Mapping,
+    num_predictions: int,
+    *,
+    msa_depth=None,
+    msa_depth_scan: bool = False,
+) -> List[tuple]:
+    """``(num_msa, num_extra_msa)`` for each prediction of one model.
+
+    A fixed ``--msa_depth`` applies to every prediction, with the extra MSA at
+    about four times the depth, as in the AlphaFold 2 configs. A scan spaces the
+    depths logarithmically from 16 (32 for the extra MSA) up to the model's own
+    defaults.
+    """
+    if msa_depth:
+        num_msa = int(msa_depth)
+        return [(num_msa, num_msa * 4)] * num_predictions
+    msa_ranges = np.rint(
+        np.logspace(np.log10(16), np.log10(evoformer_config["num_msa"]), num_predictions)
+    ).astype(int)
+    extra_msa_ranges = np.rint(
+        np.logspace(np.log10(32), np.log10(evoformer_config["num_extra_msa"]), num_predictions)
+    ).astype(int)
+    return [(int(a), int(b)) for a, b in zip(msa_ranges, extra_msa_ranges)]
+
+
+def _is_colabfold_multimer_runner(model_runner) -> bool:
+    """Whether ``model_runner`` is alphafold-colabfold's RunModel for a multimer model,
+    whose predict() recycles in a Python loop."""
+    import inspect
+    try:
+        parameters = inspect.signature(model_runner.predict).parameters
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return ("callback" in parameters
+            and hasattr(model_runner, "apply") and hasattr(model_runner, "init_params")
+            and bool(getattr(model_runner, "multimer_mode", False)))
+
+
+def _to_host_float16(tree):
+    """ColabFold's conversion of the model outputs: every array to float16 NumPy."""
+    if isinstance(tree, Mapping):
+        return {k: _to_host_float16(v) for k, v in tree.items()}
+    return np.asarray(tree, np.float16)
+
+
+def _predict_keeping_recycles_on_gpu(model_runner, feat: Dict, random_seed: int) -> Dict:
+    """alphafold-colabfold's RunModel.predict for a multimer model, with the recycling
+    state kept on the GPU.
+
+    ColabFold recycles in a Python loop and, at every recycle, copies all the outputs
+    and the recycled pair representation (L x L x 128) to the host as float16, then the
+    pair back to the GPU: hundreds of MB allocated and freed per recycle and per
+    model. With several jobs in parallel that churn is the memory pressure systemd-oomd
+    kills for. Here only the two scalars that decide early stopping leave the GPU at
+    each recycle, and the outputs once, at the end. The steps, random keys, stopping
+    rules and output types are ColabFold's; the recycled state stays float16, as
+    ColabFold feeds it back, so the compiled network is the same.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    model_runner.init_params(feat)
+    model_config = model_runner.config.model
+    num_res = feat["aatype"].shape[0]
+    prev = {
+        "prev_msa_first_row": jnp.zeros([num_res, 256], dtype=jnp.float16),
+        "prev_pair": jnp.zeros([num_res, num_res, 128], dtype=jnp.float16),
+    }
+    if "all_atom_positions" in feat:
+        prev["prev_pos"] = jnp.asarray(np.asarray(feat["all_atom_positions"], np.float16))
+    else:
+        prev["prev_pos"] = jnp.zeros([num_res, 37, 3], dtype=jnp.float16)
+
+    key = jax.random.PRNGKey(random_seed)
+    for r in range(model_config.num_recycle + 1):
+        key, sub_key = jax.random.split(key)
+        # Free the previous recycle's outputs before computing the next ones.
+        result = None
+        result = model_runner.apply(model_runner.params, sub_key, {**feat, "prev": prev})
+        prev = {k: v.astype(jnp.float16) for k, v in result.pop("prev").items()}
+        if float(result["ranking_confidence"]) > model_config.stop_at_score:
+            break
+        if r > 0 and float(result["tol"]) < model_config.recycle_early_stop_tolerance:
+            break
+    del prev
+    return _to_host_float16(result)
+
+
 def _normalize_prediction_result(
     prediction_result: Any, *, model_name: str
 ) -> Dict[str, Any]:
@@ -270,10 +550,21 @@ def _save_pae_json_file(pae: np.ndarray, max_pae: float, output_dir: str, model_
     output_dir: Directory to which files are saved.
     model_name: Name of a model.
     """
-    pae_json = generate_pae_json(pae, max_pae)
+    if pae.ndim != 2 or pae.shape[0] != pae.shape[1]:
+        raise ValueError(f'PAE must be a square matrix, got {pae.shape}')
+    # Same output as generate_pae_json, written row by row rather than built as one
+    # N x N list of Python floats and one string.
     pae_json_output_path = os.path.join(output_dir, f'pae_{model_name}.json')
-    with open(pae_json_output_path, 'w') as f:
-        f.write(pae_json)
+    with _open_atomic(pae_json_output_path) as f:
+        f.write('[{"predicted_aligned_error":[')
+        for i, row in enumerate(pae):
+            if i:
+                f.write(',')
+            f.write(json.dumps(np.round(row.astype(np.float64), decimals=1).tolist(),
+                               separators=(',', ':')))
+        f.write('],"max_predicted_aligned_error":')
+        f.write(json.dumps(max_pae))
+        f.write('}]')
 
 
 def _save_confidence_json_file(plddt: np.ndarray, output_dir: str, model_name: str) -> None:
@@ -502,7 +793,7 @@ def _write_processed_template_debug_artifacts(
 
     domain_names = processed_feature_dict.get("template_domain_names")
     if domain_names is None:
-        domain_names = [f"template_{i}"] * np.asarray(template_positions).shape[0]
+        domain_names = [f"template_{i}" for i in range(np.asarray(template_positions).shape[0])]
 
     for template_index, (positions, mask, aa, domain_name) in enumerate(
         zip(template_positions, template_masks, template_aatype, domain_names, strict=True)
@@ -721,87 +1012,76 @@ class AlphaFold2Backend(FoldingBackend):
                     f"Provided model names {model_names_custom} not part of available {model_names + old_model_names}"
                 )
 
-        for model_name in model_names:
-            model_config = config.model_config(model_name)
+        cc = _compute_capability()
+        backend = kernel_backend
+        if backend == "auto":
+            # XLA gates Pallas/Triton to sm_80+.
+            backend = "cuda_legacy" if cc is not None and cc < 80 else "pallas"
+        if use_fast_kernels and backend == "pallas" and cc is not None and cc < 80:
+            raise ValueError(
+                f"--kernel-backend pallas needs sm_80+, this GPU is sm_{cc}; "
+                "use auto or cuda_legacy")
+        if use_fast_kernels and backend == "cuda_legacy":
+            _warn_if_kernels_missing(cc)
+
+        def configured_model(name: str, num_msa=None, num_extra_msa=None):
+            """A fresh model config for one runner.
+
+            ``RunModel`` keeps a reference to its config and traces the network from
+            it on first use, so every runner needs its own copy: rewriting one shared
+            config per MSA depth left every runner at the last depth.
+            """
+            model_config = config.model_config(name)
             model_config.model.num_ensemble_eval = num_ensemble
             model_config["model"].update({"num_recycle": num_cycle})
             if dropout:
                 model_config.model.global_config.eval_dropout = True
-
-            cc = _compute_capability()
-            backend = kernel_backend
-            if backend == "auto":
-                # XLA gates Pallas/Triton to sm_80+.
-                backend = "cuda_legacy" if cc is not None and cc < 80 else "pallas"
-            if use_fast_kernels and backend == "pallas" and cc is not None and cc < 80:
-                raise ValueError(
-                    f"--kernel-backend pallas needs sm_80+, this GPU is sm_{cc}; "
-                    "use auto or cuda_legacy")
+            if num_msa is not None:
+                model_config["model"]["embeddings_and_evoformer"].update(
+                    {"num_msa": int(num_msa), "num_extra_msa": int(num_extra_msa)})
             model_config.model.global_config.use_pallas = use_fast_kernels
             model_config.model.global_config.kernel_backend = backend
             model_config.model.global_config.compute_capability = cc
             # Volta/Turing tensor cores have no bfloat16
             if use_fast_kernels and backend == "cuda_legacy":
                 model_config.model.global_config.half_dtype = "float16"
-                _warn_if_kernels_missing(cc)
-
             # Fused triangle-multiplication projections. Only turn this on if the
             # checkpoint you are loading was actually packed in fused format --
             # see the use_fuse docstring above for why a mismatch here raises a
             # Haiku "Unable to retrieve parameter" error instead of a silent
             # slowdown.
-            model_config.model.embeddings_and_evoformer.evoformer.triangle_multiplication_incoming.fuse_projection_weights = use_fuse
-            model_config.model.embeddings_and_evoformer.evoformer.triangle_multiplication_outgoing.fuse_projection_weights = use_fuse
-            if "multimer" in model_name:
-                model_config.model.embeddings_and_evoformer.template.template_pair_stack.triangle_multiplication_incoming.fuse_projection_weights = use_fuse
-                model_config.model.embeddings_and_evoformer.template.template_pair_stack.triangle_multiplication_outgoing.fuse_projection_weights = use_fuse
+            evoformer = model_config.model.embeddings_and_evoformer
+            evoformer.evoformer.triangle_multiplication_incoming.fuse_projection_weights = use_fuse
+            evoformer.evoformer.triangle_multiplication_outgoing.fuse_projection_weights = use_fuse
+            if "multimer" in name:
+                evoformer.template.template_pair_stack.triangle_multiplication_incoming.fuse_projection_weights = use_fuse
+                evoformer.template.template_pair_stack.triangle_multiplication_outgoing.fuse_projection_weights = use_fuse
+            return model_config
 
+        for model_name in model_names:
+            # The parameters are large: load them once per model name and share them
+            # between the runners built from it.
             model_params = _load_haiku_params(
                 data, model_name=model_name, data_dir=model_dir, use_fuse=use_fuse
             )
-            model_runner = model.RunModel(model_config, model_params)
-
-            if msa_depth_scan or msa_depth:
-                embeddings_and_evo = model_config["model"]["embeddings_and_evoformer"]
-                num_msa = embeddings_and_evo["num_msa"]
-                num_extra_msa = embeddings_and_evo["num_extra_msa"]
-
-                msa_ranges = np.rint(
-                    np.logspace(
-                        np.log10(16),
-                        np.log10(num_msa),
-                        num_predictions_per_model,
-                    )
-                ).astype(int)
-
-                extra_msa_ranges = np.rint(
-                    np.logspace(
-                        np.log10(32),
-                        np.log10(num_extra_msa),
-                        num_predictions_per_model,
-                    )
-                ).astype(int)
-
-            for i in range(num_predictions_per_model):
-                logging.debug(f"msa_depth is type : {type(msa_depth)} value: {msa_depth}")
-                logging.debug(f"msa_depth_scan is type: {type(msa_depth_scan)} value: {msa_depth_scan}")
-                if msa_depth or msa_depth_scan:
-                    if msa_depth:
-                        num_msa = int(msa_depth)
-                        # approx. 4x the number of msa, as in the AF2 config file
-                        num_extra_msa = int(num_msa * 4)
-                    elif msa_depth_scan:
-                        num_msa = int(msa_ranges[i])
-                        num_extra_msa = int(extra_msa_ranges[i])
-
-                    # Conversion to int before because num_msa could be None
-                    embeddings_and_evo.update(
-                        {"num_msa": num_msa, "num_extra_msa": num_extra_msa}
-                    )
-
-                    model_runners[f"{model_name}_pred_{i}_msa_{num_msa}"] = model_runner
-                else:
+            if not (msa_depth or msa_depth_scan):
+                model_runner = model.RunModel(configured_model(model_name), model_params)
+                for i in range(num_predictions_per_model):
                     model_runners[f"{model_name}_pred_{i}"] = model_runner
+                continue
+
+            depths = _msa_depths(
+                configured_model(model_name)["model"]["embeddings_and_evoformer"],
+                num_predictions_per_model,
+                msa_depth=msa_depth,
+                msa_depth_scan=msa_depth_scan,
+            )
+            runners_by_depth = {}
+            for i, depth in enumerate(depths):
+                if depth not in runners_by_depth:
+                    runners_by_depth[depth] = model.RunModel(
+                        configured_model(model_name, *depth), model_params)
+                model_runners[f"{model_name}_pred_{i}_msa_{depth[0]}"] = runners_by_depth[depth]
 
         return {"model_runners": model_runners}
 
@@ -852,6 +1132,9 @@ class AlphaFold2Backend(FoldingBackend):
         prediction_results = {}
         START = 0
         multimeric_mode = multimeric_object.multimeric_mode if hasattr(multimeric_object, "multimeric_mode") else None
+        multimer_mode = type(multimeric_object) == MultimericObject
+        seqs = multimeric_object.input_seqs if hasattr(multimeric_object, "input_seqs") else [multimeric_object.sequence]
+        total_num_res = sum(len(s) for s in seqs)
         original_feature_dict = copy(multimeric_object.feature_dict)
         if allow_resume:
             logging.info(
@@ -860,25 +1143,34 @@ class AlphaFold2Backend(FoldingBackend):
                 unrelaxed_pdb_path = os.path.join(output_dir, f"unrelaxed_{model_name}.pdb")
                 result_output_path = os.path.join(output_dir, f"result_{model_name}.pkl")
                 # If --remove_result_pickle=True the predictions are done anew.
-                if os.path.exists(unrelaxed_pdb_path) and os.path.exists(result_output_path):
-                    result_output_path = os.path.join(output_dir, f"result_{model_name}.pkl")
-                    with open(result_output_path, "rb") as f:
-                        prediction_result = pickle.load(f)
-                        # Update prediction_result with input seqs and unrelaxed protein
-                        if "seqs" not in prediction_result.keys():
-                            prediction_result.update(
-                                {"seqs": multimeric_object.input_seqs if hasattr(multimeric_object, "input_seqs") else [
-                                    multimeric_object.sequence]})
-                        if "unrelaxed_protein" not in prediction_result.keys():
-                            # Read the PDB rather than process the features again to rebuild it.
-                            with open(unrelaxed_pdb_path, "r") as pdb:
-                                unrelaxed_protein = protein.from_pdb_string(pdb.read())
-                            prediction_result.update(
-                                {"unrelaxed_protein": unrelaxed_protein})
-                    prediction_results.update({model_name: _drop_heavy_outputs(prediction_result)})
-                    START = model_index + 1
-                else:
+                if not (os.path.exists(unrelaxed_pdb_path) and os.path.exists(result_output_path)):
                     break
+                with open(result_output_path, "rb") as f:
+                    prediction_result = pickle.load(f)
+                if not _pdb_holds_prediction(unrelaxed_pdb_path, prediction_result):
+                    # Killed between writing a new pickle and its PDB: the PDB is still
+                    # the earlier prediction's, so the model is predicted again.
+                    logging.info(
+                        f"{unrelaxed_pdb_path} is not the model in {result_output_path}; "
+                        f"predicting {model_name} again.")
+                    break
+                # A pickle from an older run may still need its final scores.
+                rewrite = _finalize_scores(
+                    prediction_result, multimer_mode=multimer_mode,
+                    total_num_res=total_num_res,
+                    asym_id=original_feature_dict.get("asym_id"))
+                if "seqs" not in prediction_result:
+                    prediction_result["seqs"] = seqs
+                    rewrite = True
+                if rewrite:
+                    _dump_pickle(_jnp_to_np(prediction_result), result_output_path)
+                # Read the PDB rather than process the features again to rebuild it.
+                with open(unrelaxed_pdb_path, "r") as pdb:
+                    prediction_result["unrelaxed_protein"] = protein.from_pdb_string(pdb.read())
+                prediction_results[model_name] = _drop_heavy_outputs(prediction_result)
+                del prediction_result
+                START = model_index + 1
+            gc.collect()
         logging.info(f"{START} models are already completed.")
         if START == len(model_runners):
             logging.info(
@@ -945,9 +1237,13 @@ class AlphaFold2Backend(FoldingBackend):
             t_0 = time.time()
             logging.info(
                 f"Now running predictions on {multimeric_object.description} using {model_name}")
-            prediction_result = model_runner.predict(
-                processed_feature_dict, random_seed=model_random_seed
-            )
+            if _is_colabfold_multimer_runner(model_runner):
+                prediction_result = _predict_keeping_recycles_on_gpu(
+                    model_runner, processed_feature_dict, model_random_seed)
+            else:
+                prediction_result = model_runner.predict(
+                    processed_feature_dict, random_seed=model_random_seed
+                )
             prediction_result = _normalize_prediction_result(
                 prediction_result, model_name=model_name
             )
@@ -973,24 +1269,31 @@ class AlphaFold2Backend(FoldingBackend):
             )
             # Convert to NumPy and drop the references to the JAX arrays
             prediction_result = _jnp_to_np(prediction_result)
-            # Save prediction results to pickle file (before adding seqs / protein)
+            # Final scores now, while this model's full output is in memory: postprocess
+            # then never has to reload and rewrite a pickle.
+            _finalize_scores(
+                prediction_result, multimer_mode=multimer_mode,
+                total_num_res=total_num_res,
+                asym_id=original_feature_dict.get("asym_id"))
+            prediction_result["seqs"] = seqs
+            # Save prediction results to pickle file (before adding the protein), then
+            # the PDB: a resumed run checks that the two match.
             result_output_path = os.path.join(output_dir, f"result_{model_name}.pkl")
-            with open(result_output_path, "wb") as f:
-                pickle.dump(prediction_result, f, protocol=4)
-            prediction_result.update(
-                {"seqs": multimeric_object.input_seqs if hasattr(multimeric_object, "input_seqs") else [multimeric_object.sequence]})
-            prediction_result.update({"unrelaxed_protein": unrelaxed_protein})
-            prediction_results.update({model_name: _drop_heavy_outputs(prediction_result)})
-            # Save predictions to pdb files
+            _dump_pickle(prediction_result, result_output_path)
             unrelaxed_pdb_path = os.path.join(
                 output_dir, f"unrelaxed_{model_name}.pdb")
-
-            with open(unrelaxed_pdb_path, "w") as f:
+            with _open_atomic(unrelaxed_pdb_path) as f:
                 f.write(protein.to_pdb(unrelaxed_protein))
+            prediction_result["unrelaxed_protein"] = unrelaxed_protein
+            prediction_results[model_name] = _drop_heavy_outputs(prediction_result)
             # Save timings to json file
             timings_output_path = os.path.join(output_dir, "timings.json")
-            with open(timings_output_path, "w") as f:
+            with _open_atomic(timings_output_path) as f:
                 f.write(json.dumps(timings, indent=4))
+            # Free this model's features and outputs before predicting the next one:
+            # arrays caught in reference cycles otherwise wait for a full collection.
+            del processed_feature_dict, normalized_feature_dict, prediction_result, plddt_b_factors
+            gc.collect()
         return prediction_results
 
     @staticmethod
@@ -1019,50 +1322,20 @@ class AlphaFold2Backend(FoldingBackend):
                    'output_dir': output_dir}
             
     @staticmethod
-    def recalculate_confidence(prediction_results: Dict, multimer_mode:bool, 
-                               total_num_res: int) -> Dict[str, Any]:
+    def recalculate_confidence(prediction_results: Dict, multimer_mode: bool,
+                               total_num_res: int, asym_id=None) -> Dict[str, Any]:
+        """The entries of one prediction that its final scores change.
+
+        See ``_finalize_scores``: PAE, pTM and ipTM from the PAE logits when the model
+        returned them, cut to the real residues when the prediction was padded, and
+        the multimer ranking brought from ColabFold's 0-100 scale to 0-1. Empty when
+        the scores are already final.
         """
-        A method that remove pae values of padded residues and recalculate iptm_ptm score again 
-        Modified based on https://github.com/KosinskiLab/alphafold/blob/c844e1bb60a3beb50bb8d562c6be046da1e43e3d/alphafold/model/model.py#L31
-        """
-        if type(prediction_results['predicted_aligned_error']) == np.ndarray:
-            if prediction_results["ranking_confidence"] > 1 and multimer_mode :
-               prediction_results["ranking_confidence"] = prediction_results["ranking_confidence"]/100
-            return prediction_results
-        else:
-            output = {}
-            plddt = prediction_results['plddt'][:total_num_res]
-            if 'predicted_aligned_error' in prediction_results:
-                ptm = confidence.predicted_tm_score(
-                logits=prediction_results['predicted_aligned_error']['logits'][:total_num_res,:total_num_res],
-                breaks=prediction_results['predicted_aligned_error']['breaks'],
-                asym_id=None)
-                output['ptm'] = ptm
-                pae = confidence.compute_predicted_aligned_error(
-                logits=prediction_results['predicted_aligned_error']['logits'],
-                breaks=prediction_results['predicted_aligned_error']['breaks'])
-                max_pae = pae.pop('max_predicted_aligned_error')
-                
-                for k,v in pae.items():
-                    output.update({k:v[:total_num_res, :total_num_res]})
-                output['max_predicted_aligned_error'] = max_pae
-                if multimer_mode:
-                # Compute the ipTM only for the multimer model.
-                    iptm = confidence.predicted_tm_score(
-                    logits=prediction_results['predicted_aligned_error']['logits'][:total_num_res,:total_num_res],
-                    breaks=prediction_results['predicted_aligned_error']['breaks'],
-                    asym_id=prediction_results['predicted_aligned_error']['asym_id'][:total_num_res],
-                    interface=True)
-                    output.update({'iptm' : iptm})
-                    ranking_confidence = 0.8 * iptm + 0.2 * ptm
-                    output.update({'ranking_confidence' : ranking_confidence})
-                if not multimer_mode:
-                    # Monomer models use mean pLDDT for model ranking.
-                    ranking_confidence =  np.mean(
-                        plddt)
-                    output.update({'ranking_confidence' : ranking_confidence})
-                
-                return output
+        updated = dict(prediction_results)
+        _finalize_scores(updated, multimer_mode=multimer_mode,
+                         total_num_res=total_num_res, asym_id=asym_id)
+        return {k: v for k, v in updated.items()
+                if k not in prediction_results or v is not prediction_results[k]}
 
     @staticmethod
     def postprocess(
@@ -1132,29 +1405,23 @@ class AlphaFold2Backend(FoldingBackend):
         total_num_res = sum([len(s) for s in multimeric_object.input_seqs]) if multimer_mode else len(multimeric_object.sequence)
         # Save plddt json files.
         for model_name, prediction_result in prediction_results.items():
-          
-            prediction_result.update(AlphaFold2Backend.recalculate_confidence(prediction_result,multimer_mode,
-                                                                         total_num_res))
-            unrelaxed_protein = prediction_result.get("unrelaxed_protein")
-            
-
-            if 'unrelaxed_protein' in prediction_result.keys():
-                unrelaxed_protein = prediction_result.pop("unrelaxed_protein")
-            # Save prediction results to pickle file. The result in memory lacks the
-            # large outputs: take them from the pickle on disk, one model at a time.
-            result_output_path = os.path.join(output_dir, f"result_{model_name}.pkl")
-            full_result = {}
-            if os.path.exists(result_output_path):
-                with open(result_output_path, "rb") as f:
-                    full_result = pickle.load(f)
-            full_result.update(prediction_result)
-            # Remove jax dependency from results
-            np_prediction_result = _jnp_to_np(full_result)
-            with open(result_output_path, "wb") as f:
-                pickle.dump(np_prediction_result, f, protocol=4)
-            del full_result, np_prediction_result
-            if unrelaxed_protein is not None:
-                prediction_results[model_name]['unrelaxed_protein'] = unrelaxed_protein
+            # The scores were finalised, and the pickle written, when the model was
+            # predicted or resumed. Only results that did not go through
+            # predict_individual_job still need it, and their pickle rewriting.
+            updates = AlphaFold2Backend.recalculate_confidence(
+                prediction_result, multimer_mode, total_num_res,
+                asym_id=getattr(multimeric_object, "feature_dict", {}).get("asym_id"))
+            if updates:
+                prediction_result.update(updates)
+                result_output_path = os.path.join(output_dir, f"result_{model_name}.pkl")
+                full_result = {}
+                if os.path.exists(result_output_path):
+                    with open(result_output_path, "rb") as f:
+                        full_result = pickle.load(f)
+                full_result.update(
+                    {k: v for k, v in prediction_result.items() if k != "unrelaxed_protein"})
+                _dump_pickle(_jnp_to_np(full_result), result_output_path)
+                del full_result
             if 'iptm' in prediction_result:
                 label = 'iptm+ptm'
                 iptm_scores[model_name] = float(prediction_result['iptm'])
@@ -1191,6 +1458,7 @@ class AlphaFold2Backend(FoldingBackend):
                 figure_name=figure_name,
                 ranking=idx
             )
+            gc.collect()
 
         # Save ranking_debug.json
         with open(ranking_path, 'w') as f:
@@ -1288,17 +1556,13 @@ class AlphaFold2Backend(FoldingBackend):
         if convert_to_modelcif:
             parent_dir = os.path.dirname(os.path.dirname((os.path.abspath(__file__))))
             logging.info(f"Converting {output_dir} to ModelCIF format...")
-            command = f"python3 {parent_dir}/scripts/convert_to_modelcif.py " \
-                      f"--ap_output {output_dir} "
-
-            result = subprocess.run(command,
-                                   check=False,
-                                   shell=True,
-                                   capture_output=True,
-                                   text=True)
-
-            if result.stderr:
-                logging.error(f"Error: {result.stderr}")
+            command = [sys.executable,
+                       os.path.join(parent_dir, "scripts", "convert_to_modelcif.py"),
+                       "--ap_output", output_dir]
+            result = subprocess.run(command, check=False, capture_output=True, text=True)
+            if result.returncode != 0:
+                logging.error(f"ModelCIF conversion failed ({result.returncode}): "
+                              f"{result.stderr or result.stdout}")
             else:
                 logging.info("All PDBs converted to ModelCIF format.")
         post_prediction_process(
