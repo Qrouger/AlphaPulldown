@@ -95,12 +95,6 @@ packages = [
   "colabfold",
   "analysis_pipeline",
   "af2plots",
-  "unifold",
-  "unifold.data",
-  "unifold.modules",
-  "unifold.msa",
-  "unifold.losses",
-  "unifold.symmetry",
 ]
 script-files = [
   "./alphapulldown/scripts/create_individual_features.py",
