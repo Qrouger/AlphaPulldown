@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import tempfile
 from typing import Callable, Iterable, Sequence
 from urllib import error
@@ -49,6 +50,17 @@ _IDENTIFIER_CACHE_KEYS = (
     "msa_species_identifiers",
     "msa_uniprot_accession_identifiers",
 )
+
+# Persistent cache (accession -> taxid) shared by every process and every run,
+# so an accession is fetched from UniProt once instead of once per protein.
+# Location: $ALPHAPULLDOWN_SPECIES_CACHE if set, otherwise the default below.
+# Set the variable to "none" to disable it; delete the file to start over.
+_PERSISTENT_CACHE_ENV = "ALPHAPULLDOWN_SPECIES_CACHE"
+_PERSISTENT_CACHE_DEFAULT = os.path.join(
+    "~", ".cache", "alphapulldown", "uniprot_species_cache.sqlite"
+)
+_PERSISTENT_CACHE_TIMEOUT_SECONDS = 60
+_SQLITE_MAX_PARAMS = 500
 
 
 def _extract_sequence_identifier(description: str) -> str:
@@ -214,11 +226,87 @@ def _query_uniparc_species_ids(
     return resolved, cacheable_misses
 
 
+def _persistent_cache_path() -> str | None:
+    """Return the shared cache file, or None when it is disabled."""
+    value = os.environ.get(_PERSISTENT_CACHE_ENV, "").strip()
+    if value.lower() in ("none", "off", "false", "0"):
+        return None
+    return os.path.abspath(os.path.expanduser(value or _PERSISTENT_CACHE_DEFAULT))
+
+
+def _open_persistent_cache(path: str) -> sqlite3.Connection:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    connection = sqlite3.connect(path, timeout=_PERSISTENT_CACHE_TIMEOUT_SECONDS)
+    try:
+        connection.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.Error:
+        pass  # e.g. network filesystems: keep the default journal
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS species_ids ("
+        "accession TEXT PRIMARY KEY, taxid TEXT NOT NULL)"
+    )
+    return connection
+
+
+def _load_from_persistent_cache(accessions: Sequence[str]) -> None:
+    """Copy the taxids known on disk into the in-memory cache (best effort)."""
+    path = _persistent_cache_path()
+    wanted = sorted(
+        {a for a in accessions if a and a not in _SPECIES_ID_CACHE}
+    )
+    if not path or not wanted:
+        return
+    try:
+        connection = _open_persistent_cache(path)
+        try:
+            for chunk in _batched(wanted, _SQLITE_MAX_PARAMS):
+                placeholders = ",".join("?" * len(chunk))
+                rows = connection.execute(
+                    "SELECT accession, taxid FROM species_ids "
+                    f"WHERE accession IN ({placeholders})",
+                    list(chunk),
+                )
+                for accession, taxid in rows:
+                    _SPECIES_ID_CACHE[accession] = taxid
+        finally:
+            connection.close()
+    except (sqlite3.Error, OSError) as exc:
+        logging.warning("Unable to read species cache %s: %s", path, exc)
+
+
+def _save_to_persistent_cache(entries: dict[str, str]) -> None:
+    """Store accession -> taxid on disk (best effort).
+
+    '' means UniProt answered but gave no species (e.g. deleted entry).
+    A known taxid is never overwritten by an empty one.
+    """
+    path = _persistent_cache_path()
+    if not path or not entries:
+        return
+    try:
+        connection = _open_persistent_cache(path)
+        try:
+            with connection:
+                connection.executemany(
+                    "INSERT INTO species_ids (accession, taxid) VALUES (?, ?) "
+                    "ON CONFLICT(accession) DO UPDATE SET taxid = excluded.taxid "
+                    "WHERE excluded.taxid != ''",
+                    sorted(entries.items()),
+                )
+        finally:
+            connection.close()
+    except (sqlite3.Error, OSError) as exc:
+        logging.warning("Unable to write species cache %s: %s", path, exc)
+
+
 def resolve_species_ids_by_accession(
     accessions: Sequence[str],
     *,
     urlopen: Callable[..., object] = request.urlopen,
 ) -> dict[str, str]:
+    _load_from_persistent_cache(
+        [accession for accession in accessions if accession and _is_resolvable_accession(accession)]
+    )
     unresolved = [
         accession
         for accession in sorted(set(accessions))
@@ -248,6 +336,14 @@ def resolve_species_ids_by_accession(
             _SPECIES_ID_CACHE[accession] = species_id
         for accession in cacheable_misses:
             _SPECIES_ID_CACHE.setdefault(accession, "")
+        # Only accessions UniProt actually answered are stored; network
+        # failures are left out so they are retried next time.
+        _save_to_persistent_cache(
+            {
+                accession: _SPECIES_ID_CACHE[accession]
+                for accession in set(resolved) | cacheable_misses
+            }
+        )
 
     return {
         accession: _SPECIES_ID_CACHE.get(accession, "")
