@@ -8,6 +8,8 @@ import os
 import re
 import sqlite3
 import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Iterable, Sequence
 from urllib import error
 from urllib import parse
@@ -41,9 +43,21 @@ _UNIPROT_ACCESSION_PATTERN = re.compile(
     r'^(?:[OPQ][0-9][A-Z0-9]{3}[0-9]|[A-NR-Z][0-9](?:[A-Z][A-Z0-9]{2}[0-9]){1,2})$'
 )
 
-_UNIPROT_BATCH_SIZE = 32
+# UniProtKB taxa are fetched with the /uniprotkb/accessions endpoint, which
+# returns known entries directly instead of running a search, so it takes much
+# larger batches than the former "accession:A OR accession:B" search query.
+_UNIPROT_BATCH_SIZE = 100
+# Batches sent at the same time by one process. Kept at 1: feature generation
+# usually runs many processes in parallel already, and concurrent large
+# requests make UniProt slow down until they time out.
+_UNIPROT_MAX_PARALLEL_BATCHES = 1
+# Extra attempts for a batch on HTTP 429 / 5xx before it is split in two.
+_UNIPROT_HTTP_RETRIES = 2
+_UNIPROT_RETRY_DELAY_SECONDS = 2.0
 _UNIPARC_BATCH_SIZE = 16
-_UNIPROT_TIMEOUT_SECONDS = 30
+_UNIPROT_TIMEOUT_SECONDS = 60
+# A batch that times out is retried once, then split in two (once).
+_UNIPROT_TIMEOUT_RETRIES = 1
 _SPECIES_ID_CACHE: dict[str, str] = {}
 _IDENTIFIER_CACHE_KEYS = (
     "source_sha256",
@@ -118,10 +132,9 @@ def _query_uniprot_batch(
     *,
     urlopen: Callable[..., object],
 ) -> dict[str, object]:
-    query = " OR ".join(f"accession:{accession}" for accession in accessions)
     url = (
-        "https://rest.uniprot.org/uniprotkb/search?query="
-        f"{parse.quote(query)}"
+        "https://rest.uniprot.org/uniprotkb/accessions?accessions="
+        f"{parse.quote(','.join(accessions), safe=',')}"
         "&fields=accession,organism_id"
         "&format=json"
         f"&size={len(accessions)}"
@@ -147,6 +160,100 @@ def _query_uniparc_batch(
         return json.load(response)
 
 
+def _is_retryable_http_error(exc: Exception) -> bool:
+    return isinstance(exc, error.HTTPError) and (exc.code == 429 or exc.code >= 500)
+
+
+def _is_timeout_error(exc: Exception) -> bool:
+    if isinstance(exc, TimeoutError):  # socket.timeout, SSL read timeouts
+        return True
+    if isinstance(exc, error.URLError) and isinstance(exc.reason, TimeoutError):
+        return True
+    return _is_transport_error(exc) and "timed out" in str(exc).lower()
+
+
+def _query_uniprot_batch_resilient(
+    batch: Sequence[str],
+    *,
+    urlopen: Callable[..., object],
+    retries: int = _UNIPROT_HTTP_RETRIES,
+    timeout_retries: int = _UNIPROT_TIMEOUT_RETRIES,
+    split_on_timeout: bool = True,
+) -> tuple[list[dict[str, object]], set[str]]:
+    """Query one UniProtKB batch; return (results, accessions UniProt answered).
+
+    - a timeout (UniProt overloaded) is retried once, then the batch is split
+      in two once: smaller requests answer faster. The cost stays bounded
+      (at most 4 requests per batch) even when UniProt is down;
+    - other network (transport) errors give up on the batch;
+    - unanswered accessions are never cached, so they are retried next time;
+    - HTTP 429/5xx are retried a few times with a growing delay;
+    - an HTTP error that persists splits the batch in two (halves are not
+      retried again), so one problematic accession no longer costs one
+      request per accession of its batch;
+    - an accession that still fails on its own is left unanswered (never
+      cached), so a rejected request cannot store empty species.
+    """
+    attempt = 0
+    while True:
+        try:
+            payload = _query_uniprot_batch(batch, urlopen=urlopen)
+            return list(payload.get("results", [])), set(batch)
+        except Exception as exc:  # pragma: no cover - best-effort network fallback
+            if _is_timeout_error(exc):
+                if attempt < timeout_retries:
+                    attempt += 1
+                    time.sleep(_UNIPROT_RETRY_DELAY_SECONDS * attempt)
+                    continue
+                logging.warning(
+                    "Unable to resolve UniProtKB taxonomy for %d accessions: %s",
+                    len(batch),
+                    exc,
+                )
+                if not split_on_timeout or len(batch) == 1:
+                    return [], set()
+                middle = len(batch) // 2
+                halves = [
+                    _query_uniprot_batch_resilient(
+                        half,
+                        urlopen=urlopen,
+                        retries=0,
+                        timeout_retries=0,
+                        split_on_timeout=False,
+                    )
+                    for half in (batch[:middle], batch[middle:])
+                ]
+                return halves[0][0] + halves[1][0], halves[0][1] | halves[1][1]
+            if _is_transport_error(exc):
+                logging.warning(
+                    "Unable to resolve UniProtKB taxonomy for %d accessions: %s",
+                    len(batch),
+                    exc,
+                )
+                return [], set()
+            if _is_retryable_http_error(exc) and attempt < retries:
+                attempt += 1
+                time.sleep(_UNIPROT_RETRY_DELAY_SECONDS * attempt)
+                continue
+            logging.warning(
+                "Unable to resolve UniProtKB taxonomy for %d accessions: %s",
+                len(batch),
+                exc,
+            )
+            if len(batch) == 1:
+                return [], set()
+            middle = len(batch) // 2
+            left_results, left_answered = _query_uniprot_batch_resilient(
+                batch[:middle], urlopen=urlopen, retries=0, timeout_retries=0,
+                split_on_timeout=False,
+            )
+            right_results, right_answered = _query_uniprot_batch_resilient(
+                batch[middle:], urlopen=urlopen, retries=0, timeout_retries=0,
+                split_on_timeout=False,
+            )
+            return left_results + right_results, left_answered | right_answered
+
+
 def _query_uniprot_species_ids(
     accessions: Sequence[str],
     *,
@@ -154,32 +261,36 @@ def _query_uniprot_species_ids(
 ) -> tuple[dict[str, str], set[str]]:
     resolved: dict[str, str] = {}
     cacheable_misses: set[str] = set()
-    for batch in _batched(sorted(set(accessions)), _UNIPROT_BATCH_SIZE):
-        try:
-            payload = _query_uniprot_batch(batch, urlopen=urlopen)
-            cacheable_misses.update(batch)
-        except Exception as exc:  # pragma: no cover - best-effort network fallback
-            logging.warning(
-                "Unable to resolve UniProtKB taxonomy for %d accessions: %s",
-                len(batch),
-                exc,
+    requested = set(accessions)
+    batches = list(_batched(sorted(requested), _UNIPROT_BATCH_SIZE))
+    workers = min(_UNIPROT_MAX_PARALLEL_BATCHES, len(batches))
+    if workers > 1:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            outcomes = list(
+                executor.map(
+                    lambda batch: _query_uniprot_batch_resilient(batch, urlopen=urlopen),
+                    batches,
+                )
             )
-            if _is_transport_error(exc):
-                continue
-            payload = {"results": []}
-            for accession in batch:
-                try:
-                    single_payload = _query_uniprot_batch([accession], urlopen=urlopen)
-                except Exception as single_exc:
-                    if _is_transport_error(single_exc):
-                        continue
-                    continue
-                cacheable_misses.add(accession)
-                payload["results"].extend(single_payload["results"])
-        for result in payload.get("results", []):
+    else:
+        outcomes = [
+            _query_uniprot_batch_resilient(batch, urlopen=urlopen) for batch in batches
+        ]
+    unanswered = len(requested) - sum(len(answered) for _, answered in outcomes)
+    if unanswered:
+        logging.warning(
+            "%d UniProtKB accessions left without species after network errors; "
+            "they will be queried again next time.",
+            unanswered,
+        )
+    for results, answered in outcomes:
+        cacheable_misses.update(answered)
+        for result in results:
+            taxon_id = (result.get("organism") or {}).get("taxonId")
+            if taxon_id is None:
+                continue  # e.g. inactive (deleted) entries carry no organism
             accession = result.get("primaryAccession")
-            taxon_id = result.get("organism", {}).get("taxonId")
-            if accession and taxon_id is not None:
+            if accession:
                 resolved[accession] = str(taxon_id)
     return resolved, cacheable_misses
 
@@ -299,11 +410,100 @@ def _save_to_persistent_cache(entries: dict[str, str]) -> None:
         logging.warning("Unable to write species cache %s: %s", path, exc)
 
 
+# =================== Local species database (no UniProt) ===================
+# Accession -> taxid index built once from the taxonomy ColabFold ships with
+# uniref30_2302 by the separate script alphapulldown/scripts/
+# build_local_species_db.py (installed as build_local_species_db.py). When
+# $ALPHAPULLDOWN_LOCAL_SPECIES_DB names this file, species are read from it
+# instead of the UniProt REST API. Accessions it does not know (e.g. the
+# metagenomic colabfold_envdb identifiers) get no species, unless
+# $ALPHAPULLDOWN_SPECIES_ONLINE_FALLBACK=1 sends them to UniProt.
+_LOCAL_SPECIES_DB_ENV = "ALPHAPULLDOWN_LOCAL_SPECIES_DB"
+_ONLINE_FALLBACK_ENV = "ALPHAPULLDOWN_SPECIES_ONLINE_FALLBACK"
+_LOCAL_SPECIES_DB_TABLE = "local_species_ids"
+_local_db_connections: dict[str, sqlite3.Connection] = {}
+_local_db_warned: set[str] = set()
+
+
+def _local_species_db_path() -> str | None:
+    value = os.environ.get(_LOCAL_SPECIES_DB_ENV, "").strip()
+    return os.path.abspath(os.path.expanduser(value)) if value else None
+
+
+def _online_fallback_enabled() -> bool:
+    if _local_species_db_path() is None:
+        return True  # no local database configured: UniProt as before
+    value = os.environ.get(_ONLINE_FALLBACK_ENV, "").strip().lower()
+    return value in ("1", "true", "yes", "on")
+
+
+def _local_species_db() -> sqlite3.Connection | None:
+    """Read-only connection to the local species database, or None."""
+    path = _local_species_db_path()
+    if path is None:
+        return None
+    connection = _local_db_connections.get(path)
+    if connection is not None:
+        return connection
+    try:
+        connection = sqlite3.connect(
+            f"file:{path}?mode=ro", uri=True, check_same_thread=False
+        )
+        connection.execute(f"SELECT 1 FROM {_LOCAL_SPECIES_DB_TABLE} LIMIT 1")
+    except sqlite3.Error as exc:
+        if path not in _local_db_warned:
+            _local_db_warned.add(path)
+            logging.warning(
+                "Local species database %s is unusable (%s); falling back to "
+                "UniProt. Build it with: build_local_species_db.py "
+                "--colabfold-db-dir <dir> --out %s",
+                path, exc, path,
+            )
+        return None
+    _local_db_connections[path] = connection
+    
+    return connection
+
+
+def _load_from_local_species_db(accessions: Sequence[str]) -> set[str]:
+    """Put taxids known locally into the in-memory cache.
+
+    Returns the accessions that were looked up (i.e. the database was usable),
+    found or not.
+    """
+    connection = _local_species_db()
+    wanted = sorted({a for a in accessions if a and a not in _SPECIES_ID_CACHE})
+    if connection is None or not wanted:
+        return set()
+    try:
+        for chunk in _batched(wanted, _SQLITE_MAX_PARAMS):
+            rows = connection.execute(
+                f"SELECT accession, taxid FROM {_LOCAL_SPECIES_DB_TABLE} "
+                f"WHERE accession IN ({','.join('?' * len(chunk))})",
+                list(chunk),
+            )
+            for accession, taxid in rows:
+                _SPECIES_ID_CACHE[accession] = str(taxid)
+    except sqlite3.Error as exc:
+        logging.warning("Unable to read local species database: %s", exc)
+        return set()
+    found = sum(1 for accession in wanted if _SPECIES_ID_CACHE.get(accession))
+    
+    return set(wanted)
+
+
 def resolve_species_ids_by_accession(
     accessions: Sequence[str],
     *,
     urlopen: Callable[..., object] = request.urlopen,
 ) -> dict[str, str]:
+    looked_up_locally = _load_from_local_species_db(
+        [accession for accession in accessions if accession and _is_resolvable_accession(accession)]
+    )
+    if looked_up_locally and not _online_fallback_enabled():
+        # Unknown to the local database: no species, and no UniProt query.
+        for accession in looked_up_locally:
+            _SPECIES_ID_CACHE.setdefault(accession, "")
     _load_from_persistent_cache(
         [accession for accession in accessions if accession and _is_resolvable_accession(accession)]
     )
